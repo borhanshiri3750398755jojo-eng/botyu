@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import random
@@ -16,9 +17,12 @@ from aiogram.types import (
 
 # -------------------- Configuration --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TARGET_CHANNEL = "@spark_news_tel"
-CONTENT_CHANNEL = "@sanaooft"
 
+CHANNEL_ONE = "@spark_news_tel"
+CHANNEL_TWO = "@spark_sport"
+CHANNEL_THREE = "@spark_rap"
+
+CONTENT_CHANNEL = "@sanaooft"
 CONTENT_MESSAGE_IDS = [
     165, 164, 163, 162, 161, 160, 159, 158, 157, 156,
     155, 154, 153, 152, 151, 150, 149, 148, 147, 146,
@@ -28,7 +32,9 @@ CONTENT_MESSAGE_IDS = [
     1,
 ]
 
-# -------------------- Logging Setup --------------------
+STAGE_FILE = "user_stages.json"   # فایل ذخیره مراحل
+
+# -------------------- Logging --------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -36,169 +42,150 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# کیبورد همیشگی با دکمه "ارسال محتوا"
-content_request_keyboard = ReplyKeyboardMarkup(
+# کیبورد همیشگی
+content_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="📥 ارسال محتوا")]],
     resize_keyboard=True,
     input_field_placeholder="برای دریافت محتوا کلیک کنید",
 )
 
-# -------------------- Helper Functions --------------------
-async def is_user_member(user_id: int) -> bool:
-    """بررسی عضویت کاربر در کانال"""
+# -------------------- File‑based stage storage --------------------
+def load_stages() -> dict[int, int]:
+    """بارگذاری مراحل کاربران از فایل JSON."""
     try:
-        member = await bot.get_chat_member(chat_id=TARGET_CHANNEL, user_id=user_id)
+        with open(STAGE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # کلیدها را به int تبدیل کن (در JSON به صورت رشته ذخیره می‌شوند)
+            return {int(k): v for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_stages(stages: dict[int, int]) -> None:
+    """ذخیره مراحل در فایل JSON."""
+    with open(STAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(stages, f, ensure_ascii=False, indent=2)
+
+# بارگذاری اولیه
+user_stage = load_stages()
+
+# -------------------- Helper Functions --------------------
+async def is_member(user_id: int, channel: str) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
         return member.status not in ("left", "kicked")
     except Exception as e:
-        logger.warning(f"Failed to check membership for {user_id}: {e}")
+        logger.warning(f"عضویت {user_id} در {channel} بررسی نشد: {e}")
         return False
 
+async def missing_channels(user_id: int, channels: list[str]) -> list[str]:
+    missing = []
+    for ch in channels:
+        if not await is_member(user_id, ch):
+            missing.append(ch)
+    return missing
+
+def required_channels(stage: int) -> list[str]:
+    if stage == 0:
+        return [CHANNEL_ONE]
+    elif stage == 1:
+        return [CHANNEL_ONE, CHANNEL_TWO]
+    else:
+        return [CHANNEL_ONE, CHANNEL_TWO, CHANNEL_THREE]
+
+def missing_keyboard(missing: list[str]) -> InlineKeyboardMarkup:
+    buttons = []
+    for ch in missing:
+        link = f"https://t.me/{ch.lstrip('@')}"
+        buttons.append([InlineKeyboardButton(text=f"📢 عضویت در {ch}", url=link)])
+    buttons.append([InlineKeyboardButton(text="✅ تایید عضویت", callback_data="check_membership")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def send_random_content(chat_id: int) -> list[int]:
-    """ارسال دو پیام رندوم از کانال محتوا و برگرداندن شناسه پیام‌های ارسالی"""
     try:
-        selected_ids = random.sample(CONTENT_MESSAGE_IDS, 2)
+        selected = random.sample(CONTENT_MESSAGE_IDS, 2)
     except ValueError:
-        logger.error("Not enough message IDs to sample from.")
         return []
-
-    sent_ids = []
-    for msg_id in selected_ids:
+    sent = []
+    for mid in selected:
         try:
-            sent = await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=CONTENT_CHANNEL,
-                message_id=msg_id,
-            )
-            sent_ids.append(sent.message_id)
+            msg = await bot.copy_message(chat_id, CONTENT_CHANNEL, mid)
+            sent.append(msg.message_id)
         except Exception as e:
-            logger.error(f"Failed to copy message ID {msg_id}: {e}")
-    return sent_ids
+            logger.error(f"کپی پیام {mid} ناموفق: {e}")
+    return sent
 
-
-async def delete_after_delay(chat_id: int, message_ids: list[int], delay: int = 15):
-    """حذف پیام‌ها پس از مدتی مشخص"""
+async def delete_later(chat_id: int, ids: list[int], delay: int = 15):
     await asyncio.sleep(delay)
-    for msg_id in message_ids:
+    for mid in ids:
         try:
-            await bot.delete_message(chat_id, msg_id)
+            await bot.delete_message(chat_id, mid)
         except Exception as e:
-            logger.error(f"Failed to delete message {msg_id}: {e}")
+            logger.error(f"حذف پیام {mid} ناموفق: {e}")
 
+# -------------------- Core --------------------
+async def handle_content_request(chat_id: int, user_id: int, reply: Message | None):
+    stage = user_stage.get(user_id, 0)
+    req = required_channels(stage)
+    miss = await missing_channels(user_id, req)
 
-# -------------------- Core logic (shared) --------------------
-async def process_content_request(chat_id: int, user_id: int, reply_to_message: Message = None):
-    """
-    منطق اصلی درخواست محتوا (برای /start و دکمه "ارسال محتوا" یکسان)
-    اگر کاربر عضو باشد، محتوا ارسال می‌شود، در غیر این صورت پیام عدم عضویت.
-    """
-    if await is_user_member(user_id):
-        # ارسال تایید
-        if reply_to_message:
-            await reply_to_message.answer(
-                "✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...",
-                reply_markup=content_request_keyboard,
-            )
+    if miss:
+        text = "❌ برای استفاده از ربات، باید عضو کانال‌های زیر باشید:\n\n"
+        text += "\n".join(f"• {ch}" for ch in miss)
+        kb = missing_keyboard(miss)
+        if reply:
+            await reply.answer(text, reply_markup=kb)
         else:
-            # اگر پیامی برای پاسخ نبود، برای chat_id ارسال کن (مثلاً از callback)
-            await bot.send_message(
-                chat_id=chat_id,
-                text="✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...",
-                reply_markup=content_request_keyboard,
-            )
+            await bot.send_message(chat_id, text, reply_markup=kb)
+        return
 
-        # ارسال دو محتوای رندوم
-        sent_ids = await send_random_content(chat_id)
-        if sent_ids:
-            note = await bot.send_message(
-                chat_id=chat_id,
-                text="⏳ این تصاویر بعد ۱۵ ثانیه پاک می‌شوند.",
-            )
-            asyncio.create_task(delete_after_delay(chat_id, sent_ids, 15))
-            asyncio.create_task(delete_after_delay(chat_id, [note.message_id], 16))
+    # همه عضو هستند → ارتقای مرحله و ذخیره
+    user_stage[user_id] = stage + 1
+    save_stages(user_stage)
+
+    if reply:
+        await reply.answer("✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...", reply_markup=content_keyboard)
     else:
-        # کاربر عضو نیست
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📢 عضویت در کانال",
-                        url="https://t.me/spark_news_tel",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="✅ تایید عضویت",
-                        callback_data="check_membership",
-                    )
-                ],
-            ]
-        )
-        if reply_to_message:
-            await reply_to_message.answer(
-                "❌ برای استفاده از ربات ابتدا باید عضو کانال خبرگزاری شوید.",
-                reply_markup=keyboard,
-            )
-        else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="❌ برای استفاده از ربات ابتدا باید عضو کانال خبرگزاری شوید.",
-                reply_markup=keyboard,
-            )
+        await bot.send_message(chat_id, "✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...", reply_markup=content_keyboard)
 
+    sent = await send_random_content(chat_id)
+    if sent:
+        note = await bot.send_message(chat_id, "⏳ این تصاویر بعد ۱۵ ثانیه پاک می‌شوند.")
+        asyncio.create_task(delete_later(chat_id, sent, 15))
+        asyncio.create_task(delete_later(chat_id, [note.message_id], 16))
 
 # -------------------- Handlers --------------------
 @dp.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    await process_content_request(message.chat.id, message.from_user.id, reply_to_message=message)
-
+async def start_cmd(message: Message):
+    await handle_content_request(message.chat.id, message.from_user.id, message)
 
 @dp.message(F.text == "📥 ارسال محتوا")
-async def handle_content_button(message: Message) -> None:
-    """مدیریت کلیک روی دکمه کیبورد"""
-    await process_content_request(message.chat.id, message.from_user.id, reply_to_message=message)
-
+async def btn_handler(message: Message):
+    await handle_content_request(message.chat.id, message.from_user.id, message)
 
 @dp.callback_query(F.data == "check_membership")
-async def check_membership_callback(callback: CallbackQuery) -> None:
+async def verify_cb(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
+    stage = user_stage.get(user_id, 0)
+    req = required_channels(stage)
+    miss = await missing_channels(user_id, req)
 
-    if await is_user_member(user_id):
-        # ویرایش پیام قبلی و حذف دکمه‌های inline
+    if miss:
+        text = "❌ برای استفاده از ربات، باید عضو کانال‌های زیر باشید:\n\n"
+        text += "\n".join(f"• {ch}" for ch in miss)
+        kb = missing_keyboard(miss)
         try:
-            await callback.message.edit_text(
-                "✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...",
-                reply_markup=None,
-            )
+            await callback.message.edit_text(text, reply_markup=kb)
         except Exception:
-            await callback.message.answer("✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...")
-
-        # حالا مانند درخواست محتوای عادی عمل کن (از قبل تایید شده است)
-        # نیازی به دوباره بررسی نیست، چون عضویت تازه تأیید شد
-        sent_ids = await send_random_content(callback.message.chat.id)
-        if sent_ids:
-            note = await callback.message.answer("⏳ این تصاویر بعد ۱۵ ثانیه پاک می‌شوند.")
-            asyncio.create_task(delete_after_delay(callback.message.chat.id, sent_ids, 15))
-            asyncio.create_task(delete_after_delay(callback.message.chat.id, [note.message_id], 16))
-        # نمایش کیبورد اصلی
-        await callback.message.answer(
-            "🔽 برای دریافت محتوای جدید، دکمه زیر را بزنید:",
-            reply_markup=content_request_keyboard,
-        )
+            await callback.message.answer(text, reply_markup=kb)
     else:
-        # هنوز عضو نیست → اعلان
-        await callback.answer(
-            text="❌ شما هنوز عضو کانال نشده‌اید.\nلطفاً ابتدا عضو شوید و سپس دکمه «تایید عضویت» را بزنید.",
-            show_alert=True,
-        )
-
+        # تایید نهایی → مانند درخواست جدید
+        await handle_content_request(callback.message.chat.id, user_id, None)
 
 # -------------------- Main --------------------
-async def main() -> None:
-    logger.info("Starting bot...")
+async def main():
+    logger.info("ربات با ذخیره‌سازی مرحله در فایل اجرا شد...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
