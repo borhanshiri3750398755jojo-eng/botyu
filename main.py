@@ -5,7 +5,7 @@ import os
 import random
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, ChatMemberUpdatedFilter
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -13,10 +13,13 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     CallbackQuery,
+    ChatMemberUpdated,
 )
 
 # -------------------- Configuration --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+ADMIN_ID = 8293164271  # آی دی شما برای دریافت نوتیفیکیشن عضویت
 
 CHANNEL_ONE = "@spark_news_tel"
 CHANNEL_TWO = "@spark_sport"
@@ -32,7 +35,7 @@ CONTENT_MESSAGE_IDS = [
     1,
 ]
 
-STAGE_FILE = "user_stages.json"   # فایل ذخیره مراحل
+STAGE_FILE = "user_stages.json"
 
 # -------------------- Logging --------------------
 logging.basicConfig(level=logging.INFO)
@@ -51,21 +54,17 @@ content_keyboard = ReplyKeyboardMarkup(
 
 # -------------------- File‑based stage storage --------------------
 def load_stages() -> dict[int, int]:
-    """بارگذاری مراحل کاربران از فایل JSON."""
     try:
         with open(STAGE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # کلیدها را به int تبدیل کن (در JSON به صورت رشته ذخیره می‌شوند)
             return {int(k): v for k, v in data.items()}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_stages(stages: dict[int, int]) -> None:
-    """ذخیره مراحل در فایل JSON."""
     with open(STAGE_FILE, "w", encoding="utf-8") as f:
         json.dump(stages, f, ensure_ascii=False, indent=2)
 
-# بارگذاری اولیه
 user_stage = load_stages()
 
 # -------------------- Helper Functions --------------------
@@ -153,6 +152,24 @@ async def handle_content_request(chat_id: int, user_id: int, reply: Message | No
         asyncio.create_task(delete_later(chat_id, sent, 15))
         asyncio.create_task(delete_later(chat_id, [note.message_id], 16))
 
+# -------------------- Notification Handler --------------------
+@dp.chat_member(ChatMemberUpdatedFilter(chat_member_updated=lambda _, update: update.new_chat_member.status in ["member", "administrator"] and update.old_chat_member.status in ["left", "kicked"]))
+async def on_user_join(event: ChatMemberUpdated):
+    """When a user joins one of our channels, send a notification to admin."""
+    user = event.new_chat_member.user
+    chat = event.chat
+    user_info = f"👤 {user.full_name}" + (f" (@{user.username})" if user.username else "")
+    text = (
+        f"✅ کاربر جدید عضو کانال شد!\n\n"
+        f"{user_info}\n"
+        f"🆔 آیدی عددی: `{user.id}`\n"
+        f"📢 کانال: {chat.title} (`{chat.username or chat.id}`)"
+    )
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"ارسال نوتیفیکیشن به ادمین ناموفق: {e}")
+
 # -------------------- Handlers --------------------
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
@@ -179,12 +196,11 @@ async def verify_cb(callback: CallbackQuery):
         except Exception:
             await callback.message.answer(text, reply_markup=kb)
     else:
-        # تایید نهایی → مانند درخواست جدید
         await handle_content_request(callback.message.chat.id, user_id, None)
 
 # -------------------- Main --------------------
 async def main():
-    logger.info("ربات با ذخیره‌سازی مرحله در فایل اجرا شد...")
+    logger.info("ربات با ذخیره‌سازی مرحله و نوتیفیکیشن اجرا شد...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
