@@ -19,7 +19,7 @@ from aiogram.types import (
 # -------------------- Configuration --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-ADMIN_ID = 8293164271  # آی دی شما برای دریافت نوتیفیکیشن عضویت
+ADMIN_ID = 8293164271
 
 CHANNEL_ONE = "@spark_news_tel"
 CHANNEL_TWO = "@spark_sport"
@@ -137,7 +137,6 @@ async def handle_content_request(chat_id: int, user_id: int, reply: Message | No
             await bot.send_message(chat_id, text, reply_markup=kb)
         return
 
-    # همه عضو هستند → ارتقای مرحله و ذخیره
     user_stage[user_id] = stage + 1
     save_stages(user_stage)
 
@@ -152,10 +151,16 @@ async def handle_content_request(chat_id: int, user_id: int, reply: Message | No
         asyncio.create_task(delete_later(chat_id, sent, 15))
         asyncio.create_task(delete_later(chat_id, [note.message_id], 16))
 
-# -------------------- Notification Handler --------------------
-@dp.chat_member(ChatMemberUpdatedFilter(chat_member_updated=lambda _, update: update.new_chat_member.status in ["member", "administrator"] and update.old_chat_member.status in ["left", "kicked"]))
+# -------------------- Notification Handler (FIXED) --------------------
+@dp.chat_member(
+    ChatMemberUpdatedFilter(
+        # تابع فیلتر: وقتی کاربر از left/kicked به member/admin تبدیل شود
+        lambda update: update.new_chat_member.status in ["member", "administrator"]
+        and update.old_chat_member.status in ["left", "kicked"]
+    )
+)
 async def on_user_join(event: ChatMemberUpdated):
-    """When a user joins one of our channels, send a notification to admin."""
+    """وقتی کاربری عضو یکی از کانال‌ها می‌شود، به ادمین اطلاع بده."""
     user = event.new_chat_member.user
     chat = event.chat
     user_info = f"👤 {user.full_name}" + (f" (@{user.username})" if user.username else "")
@@ -170,7 +175,7 @@ async def on_user_join(event: ChatMemberUpdated):
     except Exception as e:
         logger.error(f"ارسال نوتیفیکیشن به ادمین ناموفق: {e}")
 
-# -------------------- Handlers --------------------
+# -------------------- User Handlers --------------------
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     await handle_content_request(message.chat.id, message.from_user.id, message)
