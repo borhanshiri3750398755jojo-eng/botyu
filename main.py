@@ -37,11 +37,7 @@ dp = Dispatcher()
 
 # -------------------- Helper Functions --------------------
 async def is_user_member(user_id: int) -> bool:
-    """
-    Check if the user is a member of the target channel.
-    Returns True if the user is a member (any status except 'left' or 'kicked'),
-    False otherwise or if an error occurs.
-    """
+    """Check if user is a member of the target channel."""
     try:
         member = await bot.get_chat_member(chat_id=TARGET_CHANNEL, user_id=user_id)
         return member.status not in ("left", "kicked")
@@ -50,28 +46,40 @@ async def is_user_member(user_id: int) -> bool:
         return False
 
 
-async def send_random_content(chat_id: int) -> None:
+async def send_random_content(chat_id: int) -> list[int]:
     """
-    Select two random, distinct message IDs from CONTENT_MESSAGE_IDS
-    and forward (copy) them from the content channel to the user.
-    If a forward fails, the error is logged and the process continues.
+    Copy two random messages from CONTENT_CHANNEL to the user.
+    Returns a list of the message_id of the sent copies.
+    Errors are logged but don't crash the bot.
     """
     try:
         selected_ids = random.sample(CONTENT_MESSAGE_IDS, 2)
     except ValueError:
-        # In case the list contains fewer than 2 items (should not happen here)
         logger.error("Not enough message IDs to sample from.")
-        return
+        return []
 
+    sent_message_ids = []
     for msg_id in selected_ids:
         try:
-            await bot.copy_message(
+            sent = await bot.copy_message(
                 chat_id=chat_id,
                 from_chat_id=CONTENT_CHANNEL,
                 message_id=msg_id,
             )
+            sent_message_ids.append(sent.message_id)
         except Exception as e:
             logger.error(f"Failed to copy message ID {msg_id}: {e}")
+    return sent_message_ids
+
+
+async def delete_after_delay(chat_id: int, message_ids: list[int], delay: int = 15):
+    """Wait `delay` seconds, then delete the messages with given IDs."""
+    await asyncio.sleep(delay)
+    for msg_id in message_ids:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except Exception as e:
+            logger.error(f"Failed to delete message {msg_id}: {e}")
 
 
 # -------------------- Handlers --------------------
@@ -81,11 +89,15 @@ async def cmd_start(message: Message) -> None:
     user_id = message.from_user.id
 
     if await is_user_member(user_id):
-        # User is already a member → confirm and send content
         await message.answer("✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...")
-        await send_random_content(message.chat.id)
+        sent_ids = await send_random_content(message.chat.id)
+        if sent_ids:
+            # Send notification and schedule deletion
+            note = await message.answer("⏳ این تصاویر بعد ۱۵ ثانیه پاک می‌شوند.")
+            asyncio.create_task(delete_after_delay(message.chat.id, sent_ids, 15))
+            # Optionally delete the notification after the content is gone
+            asyncio.create_task(delete_after_delay(message.chat.id, [note.message_id], 16))
     else:
-        # User is not a member → show join prompt with inline buttons
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -111,37 +123,29 @@ async def cmd_start(message: Message) -> None:
 @dp.callback_query(F.data == "check_membership")
 async def check_membership_callback(callback: CallbackQuery) -> None:
     """Handle the 'تایید عضویت' button press."""
-    await callback.answer()  # Acknowledge the callback to remove loading state
+    await callback.answer()
     user_id = callback.from_user.id
 
     if await is_user_member(user_id):
-        # Membership confirmed → edit the prompt message and send content
-        await callback.message.edit_text(
-            "✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...",
-            reply_markup=None,  # Remove the inline buttons
-        )
-        await send_random_content(callback.message.chat.id)
+        # Membership confirmed
+        try:
+            await callback.message.edit_text(
+                "✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...",
+                reply_markup=None,
+            )
+        except Exception:
+            await callback.message.answer("✅ عضویت شما تایید شد.\n\nدر حال ارسال محتوا...")
+
+        sent_ids = await send_random_content(callback.message.chat.id)
+        if sent_ids:
+            note = await callback.message.answer("⏳ این تصاویر بعد ۱۵ ثانیه پاک می‌شوند.")
+            asyncio.create_task(delete_after_delay(callback.message.chat.id, sent_ids, 15))
+            asyncio.create_task(delete_after_delay(callback.message.chat.id, [note.message_id], 16))
     else:
-        # Still not a member → show the same prompt again (edit text/buttons)
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📢 عضویت در کانال",
-                        url="https://t.me/spark_news_tel",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="✅ تایید عضویت",
-                        callback_data="check_membership",
-                    )
-                ],
-            ]
-        )
-        await callback.message.edit_text(
-            "❌ برای استفاده از ربات ابتدا باید عضو کانال خبرگزاری شوید.",
-            reply_markup=keyboard,
+        # Still not a member → show alert only
+        await callback.answer(
+            text="❌ شما هنوز عضو کانال نشده‌اید.\nلطفاً ابتدا عضو شوید و سپس دکمه «تایید عضویت» را بزنید.",
+            show_alert=True,
         )
 
 
